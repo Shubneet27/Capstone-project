@@ -112,7 +112,18 @@ const socket = io(SIGNALING_URL, {
     if (peersRef.current[peerId]) return peersRef.current[peerId];
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }]
+      iceServers: [
+  { urls: ["stun:stun.l.google.com:19302"] },
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turn:openrelay.metered.ca:443?transport=tcp"
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject"
+  }
+]
     });
     peersRef.current[peerId] = pc;
 
