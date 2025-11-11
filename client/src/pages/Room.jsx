@@ -33,7 +33,12 @@ export default function Room() {
 
   useEffect(() => {
     // ---------- Signaling connection ----------
-    const socket = io("http://localhost:8080", { transports: ["websocket"] });
+    const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || "https://capstone-project-r0x8.onrender.com";
+const socket = io(SIGNALING_URL, {
+  transports: ["websocket"],
+  secure: true
+});
+
     socketRef.current = socket;
 
     socket.emit("join-room", { roomId, displayName: selfNameRef.current });
