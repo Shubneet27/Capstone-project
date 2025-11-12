@@ -747,7 +747,7 @@ export default function Room() {
         }
 
         .top-bar {
-          background: #1a1a1a;
+          background: #eb1717ff;
           padding: 10px 16px;
           display: flex;
           align-items: center;
@@ -760,7 +760,7 @@ export default function Room() {
           height: 38px;
           border-radius: 50%;
           border: none;
-          background: #2a2a2a;
+          background: #c32424ff;
           color: #fff;
           margin-left: 8px;
           cursor: pointer;
@@ -782,7 +782,7 @@ export default function Room() {
           height: 100%;
           border-radius: 12px;
           overflow: hidden;
-          background: #000;
+          background: #df2c2cff;
         }
 
         video {
