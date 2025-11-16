@@ -43,7 +43,8 @@ export default function Room() {
   //                     MAIN EFFECT
   // ======================================================
   useEffect(() => {
-    const SIGNAL = import.meta.env.VITE_SIGNALING_URL || "https://webrtc-signaling-server-8web.onrender.com";
+    const SIGNAL = "https://webrtc-signaling-server-8web.onrender.com";
+
 
 
 
