@@ -2,25 +2,16 @@ import { useParams } from "react-router-dom";
 import { useEffect, useRef } from "react";
 import io from "socket.io-client";
 
-/**
- * Room.jsx
- * - Server-controlled active speaker (clients send "speaking", server emits "active-speaker")
- * - Layout T3: main active speaker on left, vertical thumbnails on right (320px)
- * - Local video always in thumbnails (so people don't see themselves big)
- * - Reactions appear on the target tile
- * - Keeps signaling logic (offer/answer/ice/datachannel)
- */
-
 export default function Room() {
   const { roomId } = useParams();
 
   // Core refs
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
-  const peersRef = useRef({}); // peerId -> RTCPeerConnection
-  const channelsRef = useRef({}); // peerId -> RTCDataChannel
-  const namesRef = useRef({}); // peerId -> displayName
-  const statusesRef = useRef({}); // peerId -> {audio,video,hand}
+  const peersRef = useRef({});
+  const channelsRef = useRef({});
+  const namesRef = useRef({});
+  const statusesRef = useRef({});
   const selfIdRef = useRef("self");
   const selfNameRef = useRef(localStorage.getItem("displayName") || prompt("Enter your name") || "You");
 
@@ -33,269 +24,308 @@ export default function Room() {
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
 
-  // Audio analysers and active speaker reporting
+  // Audio analysis for speaker detection
   const audioCtxRef = useRef(null);
-  const analysersRef = useRef({}); // peerId -> { analyser, dataArray, source }
-  const lastReportedLoudestRef = useRef(null);
+  const analysersRef = useRef({});
   const speakingIntervalRef = useRef(null);
-  const SPEAKING_REPORT_INTERVAL = 600; // ms
-  const SPEAK_THRESHOLD = 10; // minimal energy
+  const lastReportedLoudestRef = useRef(null);
+  const SPEAK_THRESHOLD = 10;
+  const SPEAKING_REPORT_INTERVAL = 600;
 
-  // store last active main set by server
   const activeSpeakerRef = useRef(null);
 
-  // initialize my display name and status
+  // -------------------------------------------------------
+  // 🚀 LAYOUT MUST EXIST BEFORE ANY WEBRTC EVENTS
+  // -------------------------------------------------------
+  function createLayoutIfNotExists() {
+    const grid = document.getElementById("video-grid");
+    if (!grid || document.getElementById("main-area")) return;
+
+    const mainArea = document.createElement("div");
+    mainArea.id = "main-area";
+    mainArea.className = "main-area";
+
+    const thumbsArea = document.createElement("div");
+    thumbsArea.id = "thumbs-area";
+    thumbsArea.className = "thumbs-area";
+
+    const selfWrap = document.createElement("div");
+    selfWrap.id = "wrapper-self";
+    selfWrap.className = "thumb-wrapper";
+    selfWrap.innerHTML = `
+      <video id="localVideo" autoplay playsinline muted></video>
+      <div class="participant-label" id="meLabel">You</div>
+      <div class="badges" id="badges-self"></div>
+    `;
+
+    thumbsArea.appendChild(selfWrap);
+    mainArea.appendChild(document.createElement("div")); // placeholder
+
+    grid.appendChild(mainArea);
+    grid.appendChild(thumbsArea);
+  }
+
+  // -------------------------------------------------------
+  // MAIN EFFECT: SOCKET, MEDIA, LAYOUT INIT
+  // -------------------------------------------------------
   useEffect(() => {
+    // step 1 — ensure layout exists
+    createLayoutIfNotExists();
+
+    // step 2 — ensure name saved
     localStorage.setItem("displayName", selfNameRef.current);
     statusesRef.current[selfIdRef.current] = { audio: true, video: true, hand: false };
-  }, []);
 
-  // ---------- Main effect: socket + local media ----------
-  useEffect(() => {
+    // step 3 — socket connect
     const SIGNAL = import.meta.env.VITE_SIGNALING_URL || "https://capstone-project-r0x8.onrender.com";
     const socket = io(SIGNAL, { transports: ["websocket"], secure: true });
     socketRef.current = socket;
 
-    // join
     socket.emit("join-room", { roomId, displayName: selfNameRef.current });
 
-    // existing peers: create offer to each (we're initiator toward existing)
     socket.on("room-peers", (peers) => {
-      peers.forEach((peerId) => createOffer(peerId, true, { displayName: selfNameRef.current }));
+      peers.forEach((peerId) =>
+        createOffer(peerId, true, { displayName: selfNameRef.current })
+      );
     });
 
-    // new peer joined: record name (existing peers will create offers)
     socket.on("peer-joined", ({ peerId, displayName }) => {
       if (displayName) namesRef.current[peerId] = displayName;
     });
 
-    // signaling (sdp / candidate)
     socket.on("signal", async ({ from, data }) => {
       let pc = peersRef.current[from] || createPeerConnection(from);
       if (!pc) return;
 
-      try {
-        if (data?.sdp) {
-          const sdp = data.sdp;
-          if (sdp.type === "offer") {
-            // handle offer
-            if (pc.signalingState !== "stable") {
-              try { await pc.setLocalDescription({ type: "rollback" }); } catch {}
-            }
-            await pc.setRemoteDescription(sdp);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            socketRef.current.emit("signal", { target: from, data: { sdp: pc.localDescription } });
-            return;
+      if (data.sdp) {
+        if (data.sdp.type === "offer") {
+          if (pc.signalingState !== "stable") {
+            try { await pc.setLocalDescription({ type: "rollback" }); } catch {}
           }
-          if (sdp.type === "answer") {
-            if (pc.signalingState === "have-local-offer") {
-              await pc.setRemoteDescription(sdp);
-            } else {
-              console.warn("Ignoring answer; wrong state:", pc.signalingState);
-            }
-            return;
-          }
+          await pc.setRemoteDescription(data.sdp);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit("signal", { target: from, data: { sdp: pc.localDescription } });
+          return;
         }
 
-        if (data?.candidate) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-          } catch (e) {
-            console.warn("Failed to add ICE candidate", e);
+        if (data.sdp.type === "answer") {
+          if (pc.signalingState === "have-local-offer") {
+            await pc.setRemoteDescription(data.sdp);
           }
+          return;
         }
-      } catch (err) {
-        console.warn("Signal handling error", err);
+      }
+
+      if (data.candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } catch {}
       }
     });
 
-    // server-sent active speaker (global)
+    // Active speaker broadcast from server
     socket.on("active-speaker", ({ activeId }) => {
-      activeSpeakerRef.current = activeId || null;
-      placeMain(activeSpeakerRef.current);
+      activeSpeakerRef.current = activeId;
+      placeMain(activeId);
     });
 
-    // peer left handling
     socket.on("peer-left", (peerId) => {
       teardownPeer(peerId);
     });
 
-    // local media + audio context
+    // Step 4 — local media
     (async () => {
       try {
         audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localStreamRef.current = stream;
 
-        // attach to local video element (created in DOM init below)
-        const localVid = document.getElementById("localVideo");
-        if (localVid) localVid.srcObject = stream;
+        const lv = document.getElementById("localVideo");
+        if (lv) lv.srcObject = stream;
 
-        // create analyser for local stream (we will still send candidates about remote loudest)
         attachAnalyser(selfIdRef.current, stream);
 
-        // wire controls and UI
         wireControls();
         refreshParticipants();
-
-        // start periodic reporting of loudest seen peer (client-side measurement)
         startSpeakingReporter();
+
       } catch (err) {
-        console.error("Media error:", err);
-        alert("Could not access camera/microphone.");
+        alert("Camera or mic blocked.");
       }
     })();
 
     return () => {
-      // cleanup
       try { socket.emit("leave-room"); } catch {}
       try { socket.disconnect(); } catch {}
+
       Object.values(peersRef.current).forEach((pc) => pc.close());
       peersRef.current = {};
-      Object.values(channelsRef.current).forEach((ch) => ch.close?.());
+      Object.values(channelsRef.current).forEach((c) => c.close?.());
       channelsRef.current = {};
-      if (speakingIntervalRef.current) { clearInterval(speakingIntervalRef.current); speakingIntervalRef.current = null; }
-      try {
-        Object.values(analysersRef.current).forEach(a => a.source?.disconnect());
-        audioCtxRef.current?.close();
-      } catch {}
+
+      if (speakingIntervalRef.current) clearInterval(speakingIntervalRef.current);
+
+      Object.values(analysersRef.current).forEach((a) => {
+        try { a.source.disconnect(); } catch {}
+      });
     };
   }, [roomId]);
-
-  // ---------- Peer connection helpers ----------
+  // -------------------------------------------------------
+  // PEER CONNECTION SETUP
+  // -------------------------------------------------------
   function createPeerConnection(peerId) {
     if (peersRef.current[peerId]) return peersRef.current[peerId];
 
     const pc = new RTCPeerConnection({
       iceServers: [
-        { urls: ["stun:stun.l.google.com:19302"] },
+        { urls: "stun:stun.l.google.com:19302" },
         {
           urls: [
             "turn:openrelay.metered.ca:80",
             "turn:openrelay.metered.ca:443",
-            "turn:openrelay.metered.ca:443?transport=tcp"
+            "turn:openrelay.metered.ca:443?transport=tcp",
           ],
           username: "openrelayproject",
-          credential: "openrelayproject"
-        }
-      ]
+          credential: "openrelayproject",
+        },
+      ],
     });
 
     peersRef.current[peerId] = pc;
 
-    // add local tracks
-    const s = localStreamRef.current;
-    if (s) s.getTracks().forEach((t) => pc.addTrack(t, s));
+    // Add local tracks
+    const stream = localStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    }
 
+    // ICE
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        socketRef.current.emit("signal", { target: peerId, data: { candidate: e.candidate } });
+        socketRef.current.emit("signal", {
+          target: peerId,
+          data: { candidate: e.candidate },
+        });
       }
     };
 
-    pc.ontrack = (e) => {
-  try {
-    const inStream = e.streams[0];
+    // -------------------------------------------------------
+    // REMOTE TRACK RECEIVED → ADD VIDEO ELEMENT
+    // -------------------------------------------------------
+    pc.ontrack = (event) => {
+      const remoteStream = event.streams[0];
 
-    // ensure DOM areas exist
-    const mainArea = document.getElementById("main-area");
-    const thumbs = document.getElementById("thumbs-area");
+      let wrap = document.getElementById(`wrapper-${peerId}`);
 
-    if (!thumbs) {
-      console.warn("Thumbs not ready yet, delaying render");
-      setTimeout(() => pc.ontrack(e), 300);
-      return;
-    }
+      // If wrapper does not exist → create new thumbnail
+      if (!wrap) {
+        wrap = document.createElement("div");
+        wrap.id = `wrapper-${peerId}`;
+        wrap.className = "thumb-wrapper";
 
-    // create wrapper
-    let wrap = document.getElementById(`wrapper-${peerId}`);
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.className = "thumb-wrapper remote-wrapper";
-      wrap.id = `wrapper-${peerId}`;
+        wrap.innerHTML = `
+          <video id="video-${peerId}" autoplay playsinline></video>
+          <div class="participant-label" id="label-${peerId}">
+            ${namesRef.current[peerId] || "Participant"}
+          </div>
+          <div class="badges" id="badges-${peerId}"></div>
+        `;
 
-      const videoEl = document.createElement("video");
-      videoEl.id = `video-${peerId}`;
-      videoEl.autoplay = true;
-      videoEl.playsInline = true;
-      videoEl.srcObject = inStream;
+        // ALWAYS push remote videos into thumbnails area
+        const thumbs = document.getElementById("thumbs-area");
+        if (thumbs) thumbs.appendChild(wrap);
+      }
 
-      const label = document.createElement("div");
-      label.className = "participant-label";
-      label.id = `label-${peerId}`;
-      label.innerText = namesRef.current[peerId] || `Participant ${peerId.slice(0,4)}`;
+      // Set remote stream
+      const videoEl = document.getElementById(`video-${peerId}`);
+      if (videoEl && !videoEl.srcObject) videoEl.srcObject = remoteStream;
 
-      const badges = document.createElement("div");
-      badges.className = "badges";
-      badges.id = `badges-${peerId}`;
+      // Attach audio analyser for speaker detection
+      attachAnalyser(peerId, remoteStream);
 
-      wrap.appendChild(videoEl);
-      wrap.appendChild(label);
-      wrap.appendChild(badges);
+      refreshParticipants();
+    };
 
-      // ALWAYS append remote wrappers to thumbnail area
-      thumbs.appendChild(wrap);
-    } else {
-      const v = document.getElementById(`video-${peerId}`);
-      if (v) v.srcObject = inStream;
-    }
-
-    attachAnalyser(peerId, inStream);
-    refreshParticipants();
-
-    // update active speaker view
-    placeMain(activeSpeakerRef.current);
-
-  } catch (err) {
-    console.warn("pc.ontrack ERROR:", err);
-  }
-};
-
-
-    pc.ondatachannel = (ev) => setupChannel(peerId, ev.channel);
+    pc.ondatachannel = (event) => {
+      setupChannel(peerId, event.channel);
+    };
 
     return pc;
   }
 
+  // -------------------------------------------------------
+  // CREATE OFFER (initiator → existing peers only)
+  // -------------------------------------------------------
   async function createOffer(peerId, isInitiator, meta) {
     const pc = createPeerConnection(peerId);
+
     if (isInitiator) {
       const ch = pc.createDataChannel("mesh");
       setupChannel(peerId, ch);
     }
+
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    socketRef.current.emit("signal", { target: peerId, data: { sdp: pc.localDescription, meta } });
+
+    socketRef.current.emit("signal", {
+      target: peerId,
+      data: { sdp: pc.localDescription, meta },
+    });
   }
 
-  // ---------- DataChannel handling ----------
-  function setupChannel(peerId, ch) {
-    channelsRef.current[peerId] = ch;
-    ch.onopen = () => {
-      ch.send(JSON.stringify({ type: "intro", name: selfNameRef.current, status: statusesRef.current[selfIdRef.current] }));
+  // -------------------------------------------------------
+  // DATA CHANNEL HANDLING
+  // -------------------------------------------------------
+  function setupChannel(peerId, channel) {
+    channelsRef.current[peerId] = channel;
+
+    channel.onopen = () => {
+      channel.send(
+        JSON.stringify({
+          type: "intro",
+          name: selfNameRef.current,
+          status: statusesRef.current[selfIdRef.current],
+        })
+      );
     };
-    ch.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
+
+    channel.onmessage = (event) => {
+      let msg = null;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
       switch (msg.type) {
         case "intro":
           namesRef.current[peerId] = msg.name;
-          statusesRef.current[peerId] = msg.status || { audio: true, video: true, hand: false };
+          statusesRef.current[peerId] = msg.status;
           refreshParticipants();
           break;
+
         case "chat":
-          appendChatMessage(namesRef.current[peerId] || peerId.slice(0, 4), msg.text, false);
+          appendChatMessage(
+            namesRef.current[peerId] || peerId.slice(0, 4),
+            msg.text,
+            false
+          );
           break;
+
         case "status":
-          statusesRef.current[peerId] = { ...(statusesRef.current[peerId] || { audio: true, video: true, hand: false }), ...msg.status };
+          statusesRef.current[peerId] = {
+            ...statusesRef.current[peerId],
+            ...msg.status,
+          };
           refreshParticipants();
           break;
+
         case "reaction":
           showReactionOnTile(msg.targetId || peerId, msg.emoji);
           break;
+
         case "hand":
-          if (!statusesRef.current[peerId]) statusesRef.current[peerId] = { audio: true, video: true, hand: false };
           statusesRef.current[peerId].hand = msg.raised;
           updateHandBadge(peerId, msg.raised);
           refreshParticipants();
@@ -304,7 +334,9 @@ export default function Room() {
     };
   }
 
-  // ---------- Teardown ----------
+  // -------------------------------------------------------
+  // REMOVE DISCONNECTED PEER
+  // -------------------------------------------------------
   function teardownPeer(peerId) {
     channelsRef.current[peerId]?.close?.();
     delete channelsRef.current[peerId];
@@ -315,30 +347,25 @@ export default function Room() {
     delete namesRef.current[peerId];
     delete statusesRef.current[peerId];
 
-    if (analysersRef.current[peerId]) {
-      try { analysersRef.current[peerId].source.disconnect(); } catch {}
-      delete analysersRef.current[peerId];
-    }
-
     const wrap = document.getElementById(`wrapper-${peerId}`);
     if (wrap) wrap.remove();
 
-    if (activeSpeakerRef.current === peerId) {
-      activeSpeakerRef.current = null;
-      placeMain(null);
-    }
     refreshParticipants();
   }
-
-  // ---------- Broadcast helper ----------
+  // -------------------------------------------------------
+  // BROADCAST UTILITY
+  // -------------------------------------------------------
   function broadcast(payload) {
     Object.entries(channelsRef.current).forEach(([pid, ch]) => {
       if (ch && ch.readyState === "open") ch.send(JSON.stringify(payload));
     });
   }
 
-  // ---------- UI wiring ----------
+  // -------------------------------------------------------
+  // UI WIRING (controls / chat)
+  // -------------------------------------------------------
   function wireControls() {
+    // ensure controls exist
     const toggleAudio = document.getElementById("toggleAudio");
     const toggleVideo = document.getElementById("toggleVideo");
     const shareScreenBtn = document.getElementById("shareScreen");
@@ -351,6 +378,8 @@ export default function Room() {
     const chatBtn = document.getElementById("chatBtn");
     const reactionsRow = document.getElementById("reactionsRow");
     const handBtn = document.getElementById("handBtn");
+    const sendMsg = document.getElementById("sendMsg");
+    const chatInput = document.getElementById("chatInput");
 
     if (toggleAudio) {
       toggleAudio.onclick = () => {
@@ -382,12 +411,15 @@ export default function Room() {
           const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
           const screenTrack = display.getVideoTracks()[0];
           isScreenSharingRef.current = true;
+
           Object.values(peersRef.current).forEach((pc) => {
             const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
             if (sender) sender.replaceTrack(screenTrack);
           });
+
           const localVideo = document.getElementById("localVideo");
           if (localVideo) localVideo.srcObject = display;
+
           screenTrack.onended = () => {
             const cam = localStreamRef.current?.getVideoTracks()[0];
             Object.values(peersRef.current).forEach((pc) => {
@@ -421,7 +453,11 @@ export default function Room() {
     if (participantsBtn) participantsBtn.onclick = () => toggleSidebar("participants");
     if (chatBtn) chatBtn.onclick = () => toggleSidebar("chat");
 
-    // reactions
+    if (sendMsg && chatInput) {
+      sendMsg.onclick = sendChat;
+      chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+    }
+
     if (reactionsRow) {
       reactionsRow.innerHTML = "";
       const emojis = ["👍","🎉","😂","❤️","🔥"];
@@ -430,7 +466,6 @@ export default function Room() {
         b.className = "reaction-btn";
         b.innerText = emoji;
         b.onclick = () => {
-          // target = server-chosen active speaker if available; otherwise first remote; otherwise self
           const target = activeSpeakerRef.current || (Object.keys(peersRef.current)[0] || selfIdRef.current);
           showReactionOnTile(target, emoji);
           broadcast({ type: "reaction", emoji, targetId: target });
@@ -449,16 +484,18 @@ export default function Room() {
       };
     }
 
-    const rec = document.getElementById("recBtn");
-    if (rec) rec.onclick = () => {
+    if (recBtn) recBtn.onclick = () => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") stopRecording();
       else startRecording();
     };
 
-    document.getElementById("meLabel") && (document.getElementById("meLabel").innerText = selfNameRef.current);
+    const meLabel = document.getElementById("meLabel");
+    if (meLabel) meLabel.innerText = selfNameRef.current;
   }
 
-  // ---------- Chat ----------
+  // -------------------------------------------------------
+  // CHAT
+  // -------------------------------------------------------
   function sendChat() {
     const input = document.getElementById("chatInput");
     if (!input) return;
@@ -478,7 +515,9 @@ export default function Room() {
     wrap.scrollTop = wrap.scrollHeight;
   }
 
-  // ---------- Participants UI ----------
+  // -------------------------------------------------------
+  // PARTICIPANTS UI
+  // -------------------------------------------------------
   function refreshParticipants() {
     const list = document.getElementById("participantsList");
     if (!list) return;
@@ -510,7 +549,9 @@ export default function Room() {
     badgeWrap.innerHTML = raised ? `<span class="badge">✋</span>` : "";
   }
 
-  // ---------- Reactions ----------
+  // -------------------------------------------------------
+  // REACTIONS
+  // -------------------------------------------------------
   function showReactionOnTile(targetId, emoji) {
     const wrapper = targetId === selfIdRef.current ? document.getElementById("wrapper-self") : document.getElementById(`wrapper-${targetId}`);
     if (!wrapper) return;
@@ -521,7 +562,9 @@ export default function Room() {
     setTimeout(() => bubble.remove(), 1400);
   }
 
-  // ---------- Recording ----------
+  // -------------------------------------------------------
+  // RECORDING
+  // -------------------------------------------------------
   function startRecording() {
     const stream = localStreamRef.current;
     if (!stream) return;
@@ -541,11 +584,12 @@ export default function Room() {
   }
   function stopRecording() { mediaRecorderRef.current?.stop(); const rec = document.getElementById("recBtn"); if (rec) rec.innerText = "⏺️"; }
 
-  // ---------- Audio analysers ----------
+  // -------------------------------------------------------
+  // AUDIO ANALYSER (active speaker detection)
+  // -------------------------------------------------------
   function attachAnalyser(peerId, stream) {
     try {
       if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      // remove previous
       if (analysersRef.current[peerId]) {
         try { analysersRef.current[peerId].source.disconnect(); } catch {}
         delete analysersRef.current[peerId];
@@ -561,7 +605,6 @@ export default function Room() {
     }
   }
 
-  // ---------- Speaking reporter (send candidate to server) ----------
   function startSpeakingReporter() {
     if (speakingIntervalRef.current) return;
     speakingIntervalRef.current = setInterval(() => {
@@ -574,32 +617,29 @@ export default function Room() {
             let sum = 0;
             for (let i = 0; i < a.dataArray.length; i++) sum += a.dataArray[i];
             const avg = sum / a.dataArray.length;
-            // We consider remote loudness; include self optionally but server policy can ignore
             if (avg > bestLevel) { bestLevel = avg; bestId = pid; }
           } catch (e) {}
         });
         if (bestLevel > SPEAK_THRESHOLD && bestId) {
-          // prefer reporting remote participants; don't constantly spam same id
           const already = lastReportedLoudestRef.current;
           if (bestId !== already) {
             lastReportedLoudestRef.current = bestId;
-            // send to server: server will broadcast "active-speaker"
-            try {
-              socketRef.current?.emit("speaking", { peerId: bestId });
-            } catch (e) {}
+            try { socketRef.current?.emit("speaking", { peerId: bestId }); } catch {}
           }
         }
       } catch (e) {}
     }, SPEAKING_REPORT_INTERVAL);
   }
 
-  // ---------- Place main tile (server controls) ----------
+  // -------------------------------------------------------
+  // PLACE MAIN (spotlight logic)
+  // -------------------------------------------------------
   function placeMain(peerId) {
     const mainArea = document.getElementById("main-area");
     const thumbs = document.getElementById("thumbs-area");
     if (!mainArea || !thumbs) return;
 
-    // move any non-self children back to thumbs
+    // move all non-self children back to thumbs
     Array.from(mainArea.children).forEach((child) => {
       if (child.id !== "wrapper-self") {
         thumbs.appendChild(child);
@@ -608,13 +648,13 @@ export default function Room() {
     });
 
     if (!peerId) {
-      // default: first remote if exists
+      // default to first remote
       const firstRemote = Object.keys(peersRef.current)[0];
       if (firstRemote) {
-        const wrap = document.getElementById(`wrapper-${firstRemote}`);
-        if (wrap) {
-          mainArea.appendChild(wrap);
-          wrap.className = "spotlight-wrapper";
+        const fwrap = document.getElementById(`wrapper-${firstRemote}`);
+        if (fwrap) {
+          mainArea.appendChild(fwrap);
+          fwrap.className = "spotlight-wrapper";
         }
       }
       return;
@@ -623,7 +663,6 @@ export default function Room() {
     const id = peerId === selfIdRef.current ? "wrapper-self" : `wrapper-${peerId}`;
     const wrap = document.getElementById(id);
     if (!wrap) {
-      // fallback to first remote
       const firstRemote = Object.keys(peersRef.current)[0];
       if (firstRemote) {
         const fwrap = document.getElementById(`wrapper-${firstRemote}`);
@@ -638,50 +677,9 @@ export default function Room() {
     wrap.className = "spotlight-wrapper";
   }
 
-  // ---------- Initialize DOM layout (main + thumbs + local wrapper) ----------
-  useEffect(() => {
-    const grid = document.getElementById("video-grid");
-    if (!grid) return;
-
-    // create main area and thumbs area
-    const mainArea = document.createElement("div");
-    mainArea.id = "main-area";
-    mainArea.className = "main-area";
-
-    const thumbsArea = document.createElement("div");
-    thumbsArea.id = "thumbs-area";
-    thumbsArea.className = "thumbs-area";
-
-    // local wrapper (in thumbs by default)
-    const selfWrap = document.createElement("div");
-    selfWrap.id = "wrapper-self";
-    selfWrap.className = "thumb-wrapper";
-    selfWrap.innerHTML = `
-      <video id="localVideo" autoplay playsinline muted></video>
-      <div class="participant-label" id="meLabel">You</div>
-      <div class="badges" id="badges-self"></div>
-    `;
-
-    // append
-    mainArea.appendChild(document.createElement("div")); // placeholder so main isn't empty layout-wise
-    thumbsArea.appendChild(selfWrap);
-
-    grid.appendChild(mainArea);
-    grid.appendChild(thumbsArea);
-
-    // wire controls and refresh participants
-    wireControls();
-    refreshParticipants();
-
-    // cleanup
-    return () => {
-      try { mainArea.remove(); } catch {}
-      try { thumbsArea.remove(); } catch {}
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ---------- Sidebar ----------
+  // -------------------------------------------------------
+  // SIDEBAR
+  // -------------------------------------------------------
   function toggleSidebar(which) {
     const panel = document.getElementById("sidePanel");
     if (!panel) return;
@@ -693,12 +691,16 @@ export default function Room() {
     if (body) body.scrollTop = body.scrollHeight;
   }
 
-  // ---------- util ----------
+  // -------------------------------------------------------
+  // UTIL
+  // -------------------------------------------------------
   function sanitize(s) {
     return String(s).replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m]));
   }
 
-  // ---------- Render ----------
+  // -------------------------------------------------------
+  // FINAL JSX RENDER
+  // -------------------------------------------------------
   return (
     <div className="room-container">
       {/* Top Bar */}
