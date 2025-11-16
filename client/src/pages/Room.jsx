@@ -195,51 +195,63 @@ export default function Room() {
     };
 
     pc.ontrack = (e) => {
-      try {
-        const inStream = e.streams[0];
-        // create video element + wrapper only AFTER we have stream and set srcObject before appending
-        let wrap = document.getElementById(`wrapper-${peerId}`);
-        if (!wrap) {
-          const videoEl = document.createElement("video");
-          videoEl.id = `video-${peerId}`;
-          videoEl.autoplay = true;
-          videoEl.playsInline = true;
-          // attach stream before DOM append to reduce flash
-          try { videoEl.srcObject = inStream; } catch (err) { console.warn("set srcObject failed", err); }
+  try {
+    const inStream = e.streams[0];
 
-          const label = document.createElement("div");
-          label.className = "participant-label";
-          label.id = `label-${peerId}`;
-          label.innerText = namesRef.current[peerId] || `Participant ${peerId.slice(0, 4)}`;
+    // ensure DOM areas exist
+    const mainArea = document.getElementById("main-area");
+    const thumbs = document.getElementById("thumbs-area");
 
-          const badges = document.createElement("div");
-          badges.className = "badges";
-          badges.id = `badges-${peerId}`;
+    if (!thumbs) {
+      console.warn("Thumbs not ready yet, delaying render");
+      setTimeout(() => pc.ontrack(e), 300);
+      return;
+    }
 
-          wrap = document.createElement("div");
-          wrap.className = "thumb-wrapper remote-wrapper";
-          wrap.id = `wrapper-${peerId}`;
+    // create wrapper
+    let wrap = document.getElementById(`wrapper-${peerId}`);
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.className = "thumb-wrapper remote-wrapper";
+      wrap.id = `wrapper-${peerId}`;
 
-          wrap.appendChild(videoEl);
-          wrap.appendChild(label);
-          wrap.appendChild(badges);
+      const videoEl = document.createElement("video");
+      videoEl.id = `video-${peerId}`;
+      videoEl.autoplay = true;
+      videoEl.playsInline = true;
+      videoEl.srcObject = inStream;
 
-          const thumbs = document.getElementById("thumbs-area");
-          if (thumbs) thumbs.appendChild(wrap); else {
-            const grid = document.getElementById("video-grid");
-            if (grid) grid.appendChild(wrap);
-          }
-        } else {
-          const v = document.getElementById(`video-${peerId}`);
-          if (v) v.srcObject = inStream;
-        }
+      const label = document.createElement("div");
+      label.className = "participant-label";
+      label.id = `label-${peerId}`;
+      label.innerText = namesRef.current[peerId] || `Participant ${peerId.slice(0,4)}`;
 
-        attachAnalyser(peerId, inStream);
-        refreshParticipants();
-      } catch (err) {
-        console.warn("pc.ontrack error", err);
-      }
-    };
+      const badges = document.createElement("div");
+      badges.className = "badges";
+      badges.id = `badges-${peerId}`;
+
+      wrap.appendChild(videoEl);
+      wrap.appendChild(label);
+      wrap.appendChild(badges);
+
+      // ALWAYS append remote wrappers to thumbnail area
+      thumbs.appendChild(wrap);
+    } else {
+      const v = document.getElementById(`video-${peerId}`);
+      if (v) v.srcObject = inStream;
+    }
+
+    attachAnalyser(peerId, inStream);
+    refreshParticipants();
+
+    // update active speaker view
+    placeMain(activeSpeakerRef.current);
+
+  } catch (err) {
+    console.warn("pc.ontrack ERROR:", err);
+  }
+};
+
 
     pc.ondatachannel = (ev) => setupChannel(peerId, ev.channel);
 
