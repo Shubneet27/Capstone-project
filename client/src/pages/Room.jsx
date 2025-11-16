@@ -43,7 +43,8 @@ export default function Room() {
   //                     MAIN EFFECT
   // ======================================================
   useEffect(() => {
-    const SIGNAL = "https://webrtc-signaling-server-8web.onrender.com";
+    const SIGNAL = "https://capstone-project-r0x8.onrender.com";
+
 
 
 
