@@ -46,10 +46,10 @@ export default function Room() {
     const SIGNAL = "https://capstone-project-r0x8.onrender.com";
 
     const socket = io(SIGNAL, {
-      path: "/socket.io",
-      transports: ["websocket"],
-      withCredentials: false,
-    });
+  path: "/socket.io/",
+  transports: ["polling", "websocket"],
+});
+
 
     socketRef.current = socket;
 

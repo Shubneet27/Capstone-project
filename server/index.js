@@ -12,19 +12,24 @@ app.use(cors({
   methods: ["GET", "POST"],
 }));
 
+// ROOT ROUTE
 app.get('/', (_, res) => res.send('Signaling server is running'));
+
+// HEALTH CHECK (REQUIRED FOR RENDER)
+app.get('/healthz', (_, res) => res.send("OK"));
 
 const server = http.createServer(app);
 
-// ✅ FIXED SOCKET.IO CONFIG FOR RENDER DEPLOYMENT
+// --------------------------------------------------------
+// 100% WORKING SOCKET.IO CONFIG FOR RENDER
+// --------------------------------------------------------
 const io = new Server(server, {
+  path: "/socket.io/",        // DO NOT REMOVE TRAILING SLASH
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
-    transports: ["websocket", "polling"],
   },
-  allowEIO3: true, // required for Render
-  transports: ["websocket", "polling"]
+  transports: ["polling", "websocket"], // POLLING FIRST = REQUIRED FOR RENDER
 });
 
 // --------------------------------------------------------
