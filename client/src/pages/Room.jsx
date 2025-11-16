@@ -8,25 +8,28 @@ export default function Room() {
   // Core refs
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
-  const peersRef = useRef({});       // peerId -> RTCPeerConnection
-  const channelsRef = useRef({});    // peerId -> DataChannel
-  const namesRef = useRef({});       // peerId -> displayName
-  const statusesRef = useRef({});    // peerId -> {audio,video,hand}
+  const peersRef = useRef({}); // peerId -> RTCPeerConnection
+  const channelsRef = useRef({}); // peerId -> RTCDataChannel
+  const namesRef = useRef({}); // peerId -> display name
+  const statusesRef = useRef({}); // peerId -> {audio,video,hand}
   const selfIdRef = useRef("self");
   const selfNameRef = useRef(localStorage.getItem("displayName") || prompt("Enter your name") || "You");
 
-  // UI / state refs
+  // UI/State refs
   const isAudioEnabledRef = useRef(true);
   const isVideoEnabledRef = useRef(true);
   const isScreenSharingRef = useRef(false);
+
+  // Recording
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
-  const activeSpeakerIdRef = useRef(null); // current spotlight id
 
-  // Audio analysis
+  // Active speaker detection
   const audioCtxRef = useRef(null);
-  const analysersRef = useRef({}); // peerId -> {analyser, dataArray, source}
+  const analysersRef = useRef({}); // id -> { analyser, dataArray, source }
+  const activeSpeakerIdRef = useRef(null);
 
+  // initial statuses
   useEffect(() => {
     localStorage.setItem("displayName", selfNameRef.current);
     statusesRef.current[selfIdRef.current] = { audio: true, video: true, hand: false };
@@ -39,87 +42,88 @@ export default function Room() {
 
     socket.emit("join-room", { roomId, displayName: selfNameRef.current });
 
-    // When joining, existing peers: we create offers to them (we are the newcomer)
     socket.on("room-peers", (peers) => {
       peers.forEach((peerId) => createOffer(peerId, true, { displayName: selfNameRef.current }));
     });
 
-    // Peer joined later - do not create offer (polite)
     socket.on("peer-joined", ({ peerId, displayName }) => {
       if (displayName) namesRef.current[peerId] = displayName;
-      console.log("Peer joined (waiting for their offer):", peerId);
+      // wait for their offer
     });
 
-    // Signaling: sdp + candidates
     socket.on("signal", async ({ from, data }) => {
-      let pc = peersRef.current[from];
-      if (!pc) pc = createPeerConnection(from);
+      let pc = peersRef.current[from] || createPeerConnection(from);
 
-      if (data.sdp) {
-        const description = data.sdp;
-        if (description.type === "offer") {
+      if (data?.sdp) {
+        const sdp = data.sdp;
+        if (sdp.type === "offer") {
+          // negotiation collision safety
           if (pc.signalingState !== "stable") {
-            console.warn("Rollback before setting remote offer");
-            await pc.setLocalDescription({ type: "rollback" });
+            try { await pc.setLocalDescription({ type: "rollback" }); } catch {}
           }
-          await pc.setRemoteDescription(description);
+          await pc.setRemoteDescription(sdp);
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           socketRef.current.emit("signal", { target: from, data: { sdp: pc.localDescription } });
-        } else if (description.type === "answer") {
+          return;
+        }
+        if (sdp.type === "answer") {
+          // only accept if we have local offer
           if (pc.signalingState === "have-local-offer") {
-            await pc.setRemoteDescription(description);
+            await pc.setRemoteDescription(sdp);
           } else {
-            console.warn("Ignoring answer - wrong state", pc.signalingState);
+            console.warn("Ignored answer due to signaling state:", pc.signalingState);
           }
         }
       }
 
-      if (data.candidate) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn("ICE add failed", e); }
+      if (data?.candidate) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn("Failed to add ICE", e); }
       }
     });
 
     socket.on("peer-left", (peerId) => teardownPeer(peerId));
 
-    // Local media + audio context
+    // Local media
     (async () => {
       try {
         audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localStreamRef.current = stream;
 
+        // attach to local video element if exists (DOM created below)
         const localVideo = document.getElementById("localVideo");
         if (localVideo) localVideo.srcObject = stream;
 
-        // create analyser for local audio
+        // create analyser for local stream
         attachAnalyser(selfIdRef.current, stream);
 
         wireControls();
         refreshParticipants();
         startActiveSpeakerLoop();
       } catch (err) {
-        console.error("Media error:", err);
+        console.error("Media access error:", err);
         alert("Could not access camera/microphone.");
       }
     })();
 
+    // cleanup on unmount
     return () => {
-      socket.emit("leave-room");
-      socket.disconnect();
-      Object.values(peersRef.current).forEach(pc => pc.close());
+      try { socket.emit("leave-room"); } catch {}
+      try { socket.disconnect(); } catch {}
+      Object.values(peersRef.current).forEach((pc) => pc.close());
       peersRef.current = {};
-      Object.values(channelsRef.current).forEach(ch => ch.close?.());
+      Object.values(channelsRef.current).forEach((ch) => ch.close?.());
       channelsRef.current = {};
-      // stop analysers and audio context
+      // disconnect analysers
       try {
-        Object.values(analysersRef.current).forEach(a => { a.source?.disconnect(); });
+        Object.values(analysersRef.current).forEach(a => a.source?.disconnect());
         audioCtxRef.current?.close();
       } catch {}
     };
   }, [roomId]);
 
-  // ---------------- Peer connection ----------------
+  // ---------------- peer connection ----------------
   function createPeerConnection(peerId) {
     if (peersRef.current[peerId]) return peersRef.current[peerId];
 
@@ -143,21 +147,48 @@ export default function Room() {
     localStreamRef.current?.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) socketRef.current.emit("signal", { target: peerId, data: { candidate: e.candidate } });
+      if (e.candidate) {
+        socketRef.current.emit("signal", { target: peerId, data: { candidate: e.candidate } });
+      }
     };
 
     pc.ontrack = (e) => {
-      // create or reuse wrapper
-      let wrapper = document.getElementById(`wrapper-${peerId}`);
-      if (!wrapper) {
-        wrapper = makeRemoteWrapper(peerId);
+      // ensure wrapper exists and video attached
+      let wrap = document.getElementById(`wrapper-${peerId}`);
+      if (!wrap) {
+        wrap = document.createElement("div");
+        wrap.className = "thumb-wrapper remote-wrapper";
+        wrap.id = `wrapper-${peerId}`;
+
+        const video = document.createElement("video");
+        video.id = `video-${peerId}`;
+        video.autoplay = true;
+        video.playsInline = true;
+
+        const label = document.createElement("div");
+        label.className = "participant-label";
+        label.id = `label-${peerId}`;
+        label.innerText = namesRef.current[peerId] || `Participant ${peerId.slice(0,4)}`;
+
+        const badges = document.createElement("div");
+        badges.className = "badges";
+        badges.id = `badges-${peerId}`;
+
+        wrap.appendChild(video);
+        wrap.appendChild(label);
+        wrap.appendChild(badges);
+
         const thumbs = document.getElementById("thumbs-area");
-        if (thumbs) thumbs.appendChild(wrapper);
+        if (thumbs) thumbs.appendChild(wrap); else {
+          // fallback to video-grid if thumbs not present
+          const grid = document.getElementById("video-grid");
+          if (grid) grid.appendChild(wrap);
+        }
       }
       const videoEl = document.getElementById(`video-${peerId}`);
       if (videoEl) videoEl.srcObject = e.streams[0];
 
-      // attach analyser for audio detection
+      // analyser for this remote stream
       attachAnalyser(peerId, e.streams[0]);
 
       refreshParticipants();
@@ -179,7 +210,7 @@ export default function Room() {
     socketRef.current.emit("signal", { target: peerId, data: { sdp: pc.localDescription, meta } });
   }
 
-  // ---------------- Data channel ----------------
+  // ---------------- data channel ----------------
   function setupChannel(peerId, ch) {
     channelsRef.current[peerId] = ch;
     ch.onopen = () => {
@@ -202,7 +233,8 @@ export default function Room() {
           refreshParticipants();
           break;
         case "reaction":
-          showReactionOnTile(msg.fromId || peerId, msg.emoji);
+          // reaction contains targetId and emoji
+          showReactionOnTile(msg.targetId, msg.emoji);
           break;
         case "hand":
           if (!statusesRef.current[peerId]) statusesRef.current[peerId] = { audio:true, video:true, hand:false };
@@ -222,25 +254,29 @@ export default function Room() {
     delete peersRef.current[peerId];
     delete namesRef.current[peerId];
     delete statusesRef.current[peerId];
-    // cleanup analyser
+
+    // remove analyser
     if (analysersRef.current[peerId]) {
       try { analysersRef.current[peerId].source.disconnect(); } catch {}
       delete analysersRef.current[peerId];
     }
+
     const wrap = document.getElementById(`wrapper-${peerId}`);
     if (wrap) wrap.remove();
-    refreshParticipants();
-    // if removed was active speaker, clear
+
+    // if active speaker left, reset
     if (activeSpeakerIdRef.current === peerId) {
       activeSpeakerIdRef.current = null;
       placeSpotlight(null);
     }
+
+    refreshParticipants();
   }
 
-  // ---------------- broadcasting ----------------
+  // ---------------- broadcast helper ----------------
   function broadcast(payload) {
     Object.entries(channelsRef.current).forEach(([pid, ch]) => {
-      if (ch.readyState === "open") ch.send(JSON.stringify(payload));
+      if (ch && ch.readyState === "open") ch.send(JSON.stringify(payload));
     });
   }
 
@@ -248,7 +284,7 @@ export default function Room() {
   function wireControls() {
     const toggleAudio = document.getElementById("toggleAudio");
     const toggleVideo = document.getElementById("toggleVideo");
-    const shareScreen = document.getElementById("shareScreen");
+    const shareScreenBtn = document.getElementById("shareScreen");
     const recBtn = document.getElementById("recBtn");
     const leaveBtn = document.getElementById("leaveBtn");
     const inviteBtn = document.getElementById("inviteBtn");
@@ -257,6 +293,7 @@ export default function Room() {
     const participantsBtn = document.getElementById("participantsBtn");
     const chatBtn = document.getElementById("chatBtn");
     const reactionsRow = document.getElementById("reactionsRow");
+    const handBtn = document.getElementById("handBtn");
 
     if (toggleAudio) {
       toggleAudio.onclick = () => {
@@ -282,8 +319,8 @@ export default function Room() {
       };
     }
 
-    if (shareScreen) {
-      shareScreen.onclick = async () => {
+    if (shareScreenBtn) {
+      shareScreenBtn.onclick = async () => {
         try {
           const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
           const screenTrack = display.getVideoTracks()[0];
@@ -303,47 +340,46 @@ export default function Room() {
             if (localVideo) localVideo.srcObject = localStreamRef.current;
             isScreenSharingRef.current = false;
           };
-        } catch (e) { console.error("Screen share error", e); }
+        } catch (e) { console.error("Screen share error", e); alert("Screen share blocked or failed"); }
       };
     }
 
-    if (inviteBtn) {
-      inviteBtn.onclick = () => {
-        const modal = document.getElementById("inviteModal");
-        const link = document.getElementById("inviteLink");
-        if (modal && link) {
-          modal.style.display = "flex";
-          link.value = window.location.href;
-        }
-      };
-    }
+    if (inviteBtn) inviteBtn.onclick = () => { const m = document.getElementById("inviteModal"); const link = document.getElementById("inviteLink"); if (m && link) { m.style.display = "flex"; link.value = window.location.href; } };
     if (closeInvite) closeInvite.onclick = () => { const m = document.getElementById("inviteModal"); if (m) m.style.display = "none"; };
-    if (copyInvite) copyInvite.onclick = async () => {
-      await navigator.clipboard.writeText(window.location.href);
-      copyInvite.innerText = "Copied!"; setTimeout(() => copyInvite.innerText = "Copy Link", 1200);
-    };
-    if (leaveBtn) leaveBtn.onclick = () => (window.location.href = "/");
+    if (copyInvite) copyInvite.onclick = async () => { await navigator.clipboard.writeText(window.location.href); copyInvite.innerText = "Copied!"; setTimeout(() => copyInvite.innerText = "Copy Link", 1200); };
+
+    if (leaveBtn) leaveBtn.onclick = () => window.location.href = "/";
     if (participantsBtn) participantsBtn.onclick = () => toggleSidebar("participants");
     if (chatBtn) chatBtn.onclick = () => toggleSidebar("chat");
 
-    // reactions
-    const emojis = ["👍","🎉","😂","❤️","🔥"];
+    // reactions row: when clicked, reaction shows on the active speaker (preferred), broadcasted to all
     if (reactionsRow) {
       reactionsRow.innerHTML = "";
-      emojis.forEach(e => {
-        const b = document.createElement("button");
-        b.className = "reaction-btn";
-        b.innerText = e;
-        b.onclick = () => {
-          // show on self tile + inform peers
-          showReactionOnTile(selfIdRef.current, e);
-          broadcast({ type: "reaction", emoji: e, fromId: selfIdRef.current });
+      const emojis = ["👍","🎉","😂","❤️","🔥"];
+      emojis.forEach(emj => {
+        const btn = document.createElement("button");
+        btn.className = "reaction-btn";
+        btn.innerText = emj;
+        btn.onclick = () => {
+          // choose target = active speaker if exists, else self
+          const target = activeSpeakerIdRef.current || selfIdRef.current;
+          showReactionOnTile(target, emj);
+          broadcast({ type: "reaction", emoji: emj, targetId: target });
         };
-        reactionsRow.appendChild(b);
+        reactionsRow.appendChild(btn);
       });
     }
 
-    // recording
+    if (handBtn) {
+      handBtn.onclick = () => {
+        const newVal = !statusesRef.current[selfIdRef.current].hand;
+        statusesRef.current[selfIdRef.current].hand = newVal;
+        updateHandBadge(selfIdRef.current, newVal);
+        broadcast({ type: "hand", raised: newVal });
+        refreshParticipants();
+      };
+    }
+
     const rec = document.getElementById("recBtn");
     if (rec) rec.onclick = () => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") stopRecording();
@@ -353,7 +389,7 @@ export default function Room() {
     document.getElementById("meLabel") && (document.getElementById("meLabel").innerText = selfNameRef.current);
   }
 
-  // ---------------- Chat ----------------
+  // ---------------- chat ----------------
   function sendChat() {
     const input = document.getElementById("chatInput");
     if (!input) return;
@@ -373,7 +409,7 @@ export default function Room() {
     wrap.scrollTop = wrap.scrollHeight;
   }
 
-  // ---------------- Participants ----------------
+  // ---------------- participants ----------------
   function refreshParticipants() {
     const list = document.getElementById("participantsList");
     if (!list) return;
@@ -405,42 +441,42 @@ export default function Room() {
     badgeWrap.innerHTML = raised ? `<span class="badge">✋</span>` : "";
   }
 
-  // ---------------- Reactions (on tile) ----------------
+  // ---------------- reaction bubble on tile ----------------
   function showReactionOnTile(targetId, emoji) {
-    // locate wrapper
     const wrapper = targetId === selfIdRef.current ? document.getElementById("wrapper-self") : document.getElementById(`wrapper-${targetId}`);
     if (!wrapper) return;
-    // create bubble
     const bubble = document.createElement("div");
     bubble.className = "reaction-bubble";
     bubble.innerText = emoji;
     wrapper.appendChild(bubble);
-    setTimeout(() => bubble.remove(), 1600);
+    setTimeout(() => bubble.remove(), 1400);
   }
 
-  // ---------------- Recording ----------------
+  // ---------------- recording ----------------
   function startRecording() {
     const stream = localStreamRef.current;
     if (!stream) return;
     recordedChunksRef.current = [];
     const mr = new MediaRecorder(stream, { mimeType: "video/webm" });
     mediaRecorderRef.current = mr;
-    mr.ondataavailable = e => { if (e.data && e.data.size) recordedChunksRef.current.push(e.data); };
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) recordedChunksRef.current.push(e.data); };
     mr.onstop = () => {
       const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a"); a.href = url; a.download = `recording-${Date.now()}.webm`; a.click();
       URL.revokeObjectURL(url);
     };
-    mr.start(); document.getElementById("recBtn") && (document.getElementById("recBtn").innerText = "⏹️");
+    mr.start();
+    const rec = document.getElementById("recBtn");
+    if (rec) rec.innerText = "⏹️";
   }
-  function stopRecording() { mediaRecorderRef.current?.stop(); document.getElementById("recBtn") && (document.getElementById("recBtn").innerText = "⏺️"); }
+  function stopRecording() { mediaRecorderRef.current?.stop(); const rec = document.getElementById("recBtn"); if (rec) rec.innerText = "⏺️"; }
 
-  // ---------------- Active Speaker (audio analysis) ----------------
+  // ---------------- audio analysers & active speaker ----------------
   function attachAnalyser(peerId, stream) {
     try {
       if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      // if already attached, disconnect
+      // remove previous if exists
       if (analysersRef.current[peerId]) {
         try { analysersRef.current[peerId].source.disconnect(); } catch {}
         delete analysersRef.current[peerId];
@@ -463,14 +499,12 @@ export default function Room() {
       Object.entries(analysersRef.current).forEach(([pid, a]) => {
         try {
           a.analyser.getByteFrequencyData(a.dataArray);
-          // compute RMS-ish level
-          let sum = 0;
-          for (let i=0;i<a.dataArray.length;i++) sum += a.dataArray[i];
+          // compute avg level
+          let sum = 0; for (let i=0;i<a.dataArray.length;i++) sum += a.dataArray[i];
           const avg = sum / a.dataArray.length;
           if (avg > bestLevel && avg > 8) { bestLevel = avg; bestId = pid; }
         } catch (e) {}
       });
-      // prefer local if speaking
       if (bestId !== activeSpeakerIdRef.current) {
         activeSpeakerIdRef.current = bestId;
         placeSpotlight(bestId);
@@ -480,80 +514,45 @@ export default function Room() {
     requestAnimationFrame(loop);
   }
 
-  // ---------------- Spotlight / Layout ----------------
-  function makeRemoteWrapper(peerId) {
-    const wrapper = document.createElement("div");
-    wrapper.className = "thumb-wrapper";
-    wrapper.id = `wrapper-${peerId}`;
-
-    const video = document.createElement("video");
-    video.id = `video-${peerId}`;
-    video.autoplay = true; video.playsInline = true;
-
-    const label = document.createElement("div");
-    label.className = "participant-label";
-    label.id = `label-${peerId}`;
-    label.innerText = namesRef.current[peerId] || `Participant ${peerId.slice(0,4)}`;
-
-    const badges = document.createElement("div");
-    badges.className = "badges";
-    badges.id = `badges-${peerId}`;
-
-    wrapper.appendChild(video);
-    wrapper.appendChild(label);
-    wrapper.appendChild(badges);
-    return wrapper;
-  }
-
+  // ---------------- spotlight & DOM helpers ----------------
   function placeSpotlight(peerId) {
     const spotlight = document.getElementById("spotlight-area");
     const thumbs = document.getElementById("thumbs-area");
     if (!spotlight || !thumbs) return;
 
-    // clear previous spotlight (move back to thumbs)
+    // move ANY leftover thumbs back into thumbs area
+    // keep wrapper-self in spotlight if no peerId
     Array.from(spotlight.children).forEach(child => {
       if (child.id && child.id !== "wrapper-self") {
         thumbs.appendChild(child);
         child.className = "thumb-wrapper";
-      } else {
-        // keep local if local is spotlight
       }
     });
 
-    // move new spotlight
     if (!peerId) {
-      // no active - keep local in spotlight by default
+      // keep self in spotlight
       const selfWrap = document.getElementById("wrapper-self");
-      if (selfWrap) {
-        spotlight.appendChild(selfWrap);
-        selfWrap.className = "spotlight-wrapper";
-      }
+      if (selfWrap) { spotlight.appendChild(selfWrap); selfWrap.className = "spotlight-wrapper"; }
       return;
     }
 
     const id = peerId === selfIdRef.current ? "wrapper-self" : `wrapper-${peerId}`;
     const wrap = document.getElementById(id);
     if (!wrap) {
-      // if not found, keep local
+      // fallback to self
       const selfWrap = document.getElementById("wrapper-self");
       if (selfWrap) { spotlight.appendChild(selfWrap); selfWrap.className = "spotlight-wrapper"; }
       return;
     }
     spotlight.appendChild(wrap);
     wrap.className = "spotlight-wrapper";
-    // rest remain thumbs (already moved up)
   }
 
-  // ---------------- Helpers ----------------
-  function sanitize(s) { return String(s).replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m])); }
-  function safeParse(s) { try { return JSON.parse(s); } catch { return null; } }
-
-  // ---------------- initial local wrapper (self) ----------------
-  // create local wrapper in DOM when component renders
+  // create local wrapper on first render (keeps DOM consistent)
   useEffect(() => {
     const grid = document.getElementById("video-grid");
     if (!grid) return;
-    // create containers
+    // build two-column layout: spotlight + thumbs
     const spotlightArea = document.createElement("div");
     spotlightArea.id = "spotlight-area";
     spotlightArea.className = "spotlight-area";
@@ -571,42 +570,46 @@ export default function Room() {
       <div class="participant-label" id="meLabel">You</div>
       <div class="badges" id="badges-self"></div>
     `;
-    spotlightArea.appendChild(selfWrap);
 
-    // append both to grid
+    spotlightArea.appendChild(selfWrap);
     grid.appendChild(spotlightArea);
     grid.appendChild(thumbsArea);
 
-    // ensure reactions area and controls wired once local wrapper present
+    // wire controls after local wrapper elements exist
     wireControls();
     refreshParticipants();
 
+    // cleanup on unmount
     return () => {
-      // cleanup DOM areas if unmount
-      try { spotlightArea.remove(); thumbsArea.remove(); } catch {}
+      try { spotlightArea.remove(); } catch (e) {}
+      try { thumbsArea.remove(); } catch (e) {}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------------- Chat / sidebar / misc ----------------
+  // ---------------- sidebar toggle ----------------
   function toggleSidebar(which) {
     const panel = document.getElementById("sidePanel");
     if (!panel) return;
     if (panel.dataset.open === which) {
       panel.dataset.open = ""; panel.style.right = "-360px";
-    } else { panel.dataset.open = which; panel.style.right = "0px"; document.getElementById("sideBody") && (document.getElementById("sideBody").scrollTop = document.getElementById("sideBody").scrollHeight); }
+      return;
+    }
+    panel.dataset.open = which; panel.style.right = "0px";
+    const body = document.getElementById("sideBody");
+    if (body) body.scrollTop = body.scrollHeight;
   }
 
-  // ---------------- DOM utils for reactions from other peers ----------------
-  // show reaction already implemented: showReactionOnTile
+  // ---------------- util ----------------
+  function sanitize(s) { return String(s).replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m])); }
 
-  // ---------------- Render ----------------
+  // ---------------- render ----------------
   return (
     <div className="room-container">
-      {/* Top Bar */}
+      {/* Top */}
       <div className="top-bar">
         <div className="branding">WebRTC • TeamMeet</div>
-        <div className="room-info">Room: {roomId}</div>
+        <div className="room-info">Room ID: {roomId}</div>
         <div className="top-actions">
           <button id="inviteBtn" title="Invite">🔗</button>
           <button id="participantsBtn" title="Participants">👥</button>
@@ -614,21 +617,23 @@ export default function Room() {
         </div>
       </div>
 
-      {/* Video Grid */}
+      {/* Video grid - local DOM containers created in useEffect */}
       <div id="video-grid" className="video-grid"></div>
 
-      {/* Controls bar */}
+      {/* Controls */}
       <div className="controls-bar">
         <div className="left-pad">
-          <button id="handBtn" title="Raise hand">✋</button>
+          <button id="handBtn">✋</button>
           <div id="reactionsRow" className="reactions-row"></div>
         </div>
+
         <div className="center-controls">
-          <button id="toggleAudio" title="Mute">🔊</button>
-          <button id="toggleVideo" title="Camera">🎥</button>
-          <button id="shareScreen" title="Share screen">🖥️</button>
-          <button id="recBtn" title="Record">⏺️</button>
+          <button id="toggleAudio">🔊</button>
+          <button id="toggleVideo">🎥</button>
+          <button id="shareScreen">🖥️</button>
+          <button id="recBtn">⏺️</button>
         </div>
+
         <div className="right-pad">
           <button id="leaveBtn" className="leave-btn">❌</button>
         </div>
@@ -646,12 +651,9 @@ export default function Room() {
         </div>
       </div>
 
-      {/* Side Panel */}
+      {/* Side panel (participants & chat) */}
       <div id="sidePanel" className="side-panel" data-open="">
-        <div className="tabs">
-          <div>Participants</div>
-          <div>Chat</div>
-        </div>
+        <div className="tabs"><div>Participants</div><div>Chat</div></div>
         <div id="sideBody" className="side-body">
           <div className="section">
             <div className="section-title">Participants</div>
@@ -670,27 +672,24 @@ export default function Room() {
 
       {/* Styles */}
       <style>{`
-        :root {
-          --bg:#0b0d0f; --panel:#0f1113; --muted:#8b8f94; --accent:#1f6feb; --glass: rgba(255,255,255,0.04);
-        }
+        :root { --bg:#0b0d0f; --panel:#0f1113; --muted:#8b8f94; }
         *{box-sizing:border-box}
-        body{margin:0;font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;color:#e6eef6;background:var(--bg);}
-        .room-container{height:100vh;display:flex;flex-direction:column;overflow:hidden;}
+        body{margin:0;font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial;color:#e6eef6;background:var(--bg)}
+        .room-container{height:100vh;display:flex;flex-direction:column;overflow:hidden}
 
-        .top-bar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:linear-gradient(90deg,#0d0f11, #0b0d0f);border-bottom:1px solid rgba(255,255,255,0.03)}
-        .branding{font-weight:700;font-size:18px;color:#fff}
+        .top-bar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:linear-gradient(90deg,#0d0f11,#0b0d0f);border-bottom:1px solid rgba(255,255,255,0.03)}
+        .branding{font-weight:700;font-size:18px}
         .room-info{color:var(--muted)}
         .top-actions button{margin-left:8px;background:transparent;border:1px solid rgba(255,255,255,0.03);color:#fff;padding:8px;border-radius:8px;cursor:pointer}
 
         .video-grid{flex:1;display:flex;gap:12px;padding:16px;align-items:stretch;justify-content:stretch;overflow:hidden}
-        /* spotlight on left, thumbs on right */
         .spotlight-area{flex:2;display:flex;align-items:center;justify-content:center;min-width:0}
         .thumbs-area{width:320px;display:flex;flex-direction:column;gap:12px;overflow:auto;padding:8px}
 
         .spotlight-wrapper{position:relative;border-radius:14px;overflow:hidden;background:#000;box-shadow:0 10px 30px rgba(0,0,0,0.6);height:100%;width:100%;display:flex;align-items:center;justify-content:center}
         .thumb-wrapper{position:relative;border-radius:10px;overflow:hidden;background:#050607;box-shadow:0 6px 20px rgba(0,0,0,0.6);height:180px;width:100%;display:flex;align-items:center;justify-content:center}
 
-        .spotlight-wrapper video, .thumb-wrapper video{width:100%;height:100%;object-fit:cover;display:block}
+        video{width:100%;height:100%;object-fit:cover;display:block}
         .participant-label{position:absolute;left:12px;bottom:12px;background:linear-gradient(90deg,rgba(0,0,0,0.6),rgba(0,0,0,0.35));padding:6px 10px;border-radius:8px;font-size:13px}
         .badges{position:absolute;right:12px;top:12px;display:flex;gap:6px}
         .badge{background:rgba(255,255,255,0.06);padding:4px 6px;border-radius:6px;font-size:13px}
@@ -720,11 +719,9 @@ export default function Room() {
         .chat-line{margin-bottom:6px}
         .chat-line .author{color:#7fb3ff;margin-right:6px}
 
-        /* reaction bubble */
-        .reaction-bubble{position:absolute;left:50%;top:10%;transform:translateX(-50%);font-size:28px;padding:6px;border-radius:16px;background:linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));box-shadow:0 6px 18px rgba(0,0,0,0.6);animation:popUp 1.2s ease forwards;pointer-events:none}
+        .reaction-bubble{position:absolute;left:50%;top:12%;transform:translateX(-50%);font-size:28px;padding:6px;border-radius:16px;background:linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));box-shadow:0 6px 18px rgba(0,0,0,0.6);animation:popUp 1.2s ease forwards;pointer-events:none}
         @keyframes popUp {0%{transform:translate(-50%,0) scale(.9);opacity:0}20%{opacity:1;transform:translate(-50%,-8%) scale(1.08)}100%{opacity:0;transform:translate(-50%,-120%) scale(.8)}}
 
-        /* small screens */
         @media (max-width:900px) {
           .video-grid{flex-direction:column}
           .thumbs-area{width:100%;height:220px;flex-direction:row;overflow-x:auto;gap:8px}
