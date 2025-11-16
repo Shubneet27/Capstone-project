@@ -43,7 +43,9 @@ export default function Room() {
   //                     MAIN EFFECT
   // ======================================================
   useEffect(() => {
-    const SIGNAL = import.meta.env.VITE_SIGNALING_URL || "https://capstone-project-r0x8.onrender.com";
+    const SIGNAL = import.meta.env.VITE_SIGNALING_URL || "https://webrtc-signaling-server-8web.onrender.com";
+
+
 
     const socket = io(SIGNAL, {
       transports: ["websocket"],
