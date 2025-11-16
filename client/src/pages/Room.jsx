@@ -4,13 +4,11 @@ import io from "socket.io-client";
 
 /**
  * Room.jsx
- * - Main left = active speaker (big)
- * - Right vertical thumbnails = 320px
- * - Smooth active speaker switching (1.2s cooldown)
- * - Local video remains in thumbnails (not main) to avoid each user seeing themselves large
- * - Reactions appear on the target tile (bubble animation)
- *
- * Works with your existing signaling server (VITE_SIGNALING_URL or default).
+ * - Server-controlled active speaker (clients send "speaking", server emits "active-speaker")
+ * - Layout T3: main active speaker on left, vertical thumbnails on right (320px)
+ * - Local video always in thumbnails (so people don't see themselves big)
+ * - Reactions appear on the target tile
+ * - Keeps signaling logic (offer/answer/ice/datachannel)
  */
 
 export default function Room() {
@@ -21,7 +19,7 @@ export default function Room() {
   const localStreamRef = useRef(null);
   const peersRef = useRef({}); // peerId -> RTCPeerConnection
   const channelsRef = useRef({}); // peerId -> RTCDataChannel
-  const namesRef = useRef({}); // peerId -> name
+  const namesRef = useRef({}); // peerId -> displayName
   const statusesRef = useRef({}); // peerId -> {audio,video,hand}
   const selfIdRef = useRef("self");
   const selfNameRef = useRef(localStorage.getItem("displayName") || prompt("Enter your name") || "You");
@@ -35,48 +33,54 @@ export default function Room() {
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
 
-  // Active speaker detection
+  // Audio analysers and active speaker reporting
   const audioCtxRef = useRef(null);
   const analysersRef = useRef({}); // peerId -> { analyser, dataArray, source }
-  const activeSpeakerIdRef = useRef(null);
-  const speakerCandidateRef = useRef(null);
-  const lastSwitchTimeRef = useRef(0);
-  const SWITCH_COOLDOWN_MS = 1200; // 1.2s smooth cooldown
+  const lastReportedLoudestRef = useRef(null);
+  const speakingIntervalRef = useRef(null);
+  const SPEAKING_REPORT_INTERVAL = 600; // ms
+  const SPEAK_THRESHOLD = 10; // minimal energy
 
+  // store last active main set by server
+  const activeSpeakerRef = useRef(null);
+
+  // initialize my display name and status
   useEffect(() => {
     localStorage.setItem("displayName", selfNameRef.current);
     statusesRef.current[selfIdRef.current] = { audio: true, video: true, hand: false };
   }, []);
 
+  // ---------- Main effect: socket + local media ----------
   useEffect(() => {
     const SIGNAL = import.meta.env.VITE_SIGNALING_URL || "https://capstone-project-r0x8.onrender.com";
     const socket = io(SIGNAL, { transports: ["websocket"], secure: true });
     socketRef.current = socket;
 
-    // join the room
+    // join
     socket.emit("join-room", { roomId, displayName: selfNameRef.current });
 
-    // existing peers -> create offers to them (we're the newcomer creating offers to existing)
+    // existing peers: create offer to each (we're initiator toward existing)
     socket.on("room-peers", (peers) => {
       peers.forEach((peerId) => createOffer(peerId, true, { displayName: selfNameRef.current }));
     });
 
-    // new peer joined (we wait for their offer)
+    // new peer joined: record name (existing peers will create offers)
     socket.on("peer-joined", ({ peerId, displayName }) => {
       if (displayName) namesRef.current[peerId] = displayName;
-      // do nothing - the existing peers should create offers
     });
 
-    // signaling handler
+    // signaling (sdp / candidate)
     socket.on("signal", async ({ from, data }) => {
       let pc = peersRef.current[from] || createPeerConnection(from);
-      if (data?.sdp) {
-        const sdp = data.sdp;
-        try {
+      if (!pc) return;
+
+      try {
+        if (data?.sdp) {
+          const sdp = data.sdp;
           if (sdp.type === "offer") {
-            // safe rollback if needed
+            // handle offer
             if (pc.signalingState !== "stable") {
-              try { await pc.setLocalDescription({ type: "rollback" }); } catch (e) {}
+              try { await pc.setLocalDescription({ type: "rollback" }); } catch {}
             }
             await pc.setRemoteDescription(sdp);
             const answer = await pc.createAnswer();
@@ -88,46 +92,55 @@ export default function Room() {
             if (pc.signalingState === "have-local-offer") {
               await pc.setRemoteDescription(sdp);
             } else {
-              console.warn("Ignoring answer due to signaling state:", pc.signalingState);
+              console.warn("Ignoring answer; wrong state:", pc.signalingState);
             }
             return;
           }
-        } catch (err) {
-          console.warn("SDP handling error:", err);
         }
-      }
 
-      if (data?.candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-        } catch (e) {
-          console.warn("Failed to add ICE candidate", e);
+        if (data?.candidate) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } catch (e) {
+            console.warn("Failed to add ICE candidate", e);
+          }
         }
+      } catch (err) {
+        console.warn("Signal handling error", err);
       }
     });
 
-    socket.on("peer-left", (peerId) => teardownPeer(peerId));
+    // server-sent active speaker (global)
+    socket.on("active-speaker", ({ activeId }) => {
+      activeSpeakerRef.current = activeId || null;
+      placeMain(activeSpeakerRef.current);
+    });
 
-    // local media & audio context
+    // peer left handling
+    socket.on("peer-left", (peerId) => {
+      teardownPeer(peerId);
+    });
+
+    // local media + audio context
     (async () => {
       try {
         audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localStreamRef.current = stream;
 
-        // ensure DOM elements exist (local wrapper created in useEffect below)
+        // attach to local video element (created in DOM init below)
         const localVid = document.getElementById("localVideo");
         if (localVid) localVid.srcObject = stream;
 
-        // attach analyser for local (we won't select self as active speaker but we still monitor)
+        // create analyser for local stream (we will still send candidates about remote loudest)
         attachAnalyser(selfIdRef.current, stream);
 
-        // wire up controls and UI
+        // wire controls and UI
         wireControls();
         refreshParticipants();
 
-        // start active speaker loop
-        startActiveSpeakerLoop();
+        // start periodic reporting of loudest seen peer (client-side measurement)
+        startSpeakingReporter();
       } catch (err) {
         console.error("Media error:", err);
         alert("Could not access camera/microphone.");
@@ -135,12 +148,14 @@ export default function Room() {
     })();
 
     return () => {
+      // cleanup
       try { socket.emit("leave-room"); } catch {}
       try { socket.disconnect(); } catch {}
       Object.values(peersRef.current).forEach((pc) => pc.close());
       peersRef.current = {};
       Object.values(channelsRef.current).forEach((ch) => ch.close?.());
       channelsRef.current = {};
+      if (speakingIntervalRef.current) { clearInterval(speakingIntervalRef.current); speakingIntervalRef.current = null; }
       try {
         Object.values(analysersRef.current).forEach(a => a.source?.disconnect());
         audioCtxRef.current?.close();
@@ -148,7 +163,7 @@ export default function Room() {
     };
   }, [roomId]);
 
-  // --------- Peer connection helpers ----------
+  // ---------- Peer connection helpers ----------
   function createPeerConnection(peerId) {
     if (peersRef.current[peerId]) return peersRef.current[peerId];
 
@@ -159,18 +174,19 @@ export default function Room() {
           urls: [
             "turn:openrelay.metered.ca:80",
             "turn:openrelay.metered.ca:443",
-            "turn:openrelay.metered.ca:443?transport=tcp",
+            "turn:openrelay.metered.ca:443?transport=tcp"
           ],
           username: "openrelayproject",
-          credential: "openrelayproject",
-        },
-      ],
+          credential: "openrelayproject"
+        }
+      ]
     });
+
     peersRef.current[peerId] = pc;
 
     // add local tracks
-    const stream = localStreamRef.current;
-    if (stream) stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    const s = localStreamRef.current;
+    if (s) s.getTracks().forEach((t) => pc.addTrack(t, s));
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -180,16 +196,16 @@ export default function Room() {
 
     pc.ontrack = (e) => {
       try {
-        const stream = e.streams[0];
-        // create wrapper only after we have the stream and set srcObject before appending to DOM
+        const inStream = e.streams[0];
+        // create video element + wrapper only AFTER we have stream and set srcObject before appending
         let wrap = document.getElementById(`wrapper-${peerId}`);
         if (!wrap) {
           const videoEl = document.createElement("video");
           videoEl.id = `video-${peerId}`;
           videoEl.autoplay = true;
           videoEl.playsInline = true;
-          // attach stream before creating wrapper DOM to minimize black flash
-          try { videoEl.srcObject = stream; } catch (err) { console.warn("set srcObject failed", err); }
+          // attach stream before DOM append to reduce flash
+          try { videoEl.srcObject = inStream; } catch (err) { console.warn("set srcObject failed", err); }
 
           const label = document.createElement("div");
           label.className = "participant-label";
@@ -208,25 +224,20 @@ export default function Room() {
           wrap.appendChild(label);
           wrap.appendChild(badges);
 
-          // append to thumbs area (not main). main placement handled by active speaker logic
           const thumbs = document.getElementById("thumbs-area");
-          if (thumbs) thumbs.appendChild(wrap);
-          else {
+          if (thumbs) thumbs.appendChild(wrap); else {
             const grid = document.getElementById("video-grid");
             if (grid) grid.appendChild(wrap);
           }
         } else {
-          // if wrapper exists, set srcObject on existing video
           const v = document.getElementById(`video-${peerId}`);
-          if (v) v.srcObject = stream;
+          if (v) v.srcObject = inStream;
         }
 
-        // attach analyser to this incoming stream (for active speaker detection)
-        attachAnalyser(peerId, stream);
-
+        attachAnalyser(peerId, inStream);
         refreshParticipants();
       } catch (err) {
-        console.warn("ontrack handler error", err);
+        console.warn("pc.ontrack error", err);
       }
     };
 
@@ -246,7 +257,7 @@ export default function Room() {
     socketRef.current.emit("signal", { target: peerId, data: { sdp: pc.localDescription, meta } });
   }
 
-  // --------- data channel handling ----------
+  // ---------- DataChannel handling ----------
   function setupChannel(peerId, ch) {
     channelsRef.current[peerId] = ch;
     ch.onopen = () => {
@@ -269,7 +280,6 @@ export default function Room() {
           refreshParticipants();
           break;
         case "reaction":
-          // show reaction bubble on target tile
           showReactionOnTile(msg.targetId || peerId, msg.emoji);
           break;
         case "hand":
@@ -282,7 +292,7 @@ export default function Room() {
     };
   }
 
-  // --------- teardown ----------
+  // ---------- Teardown ----------
   function teardownPeer(peerId) {
     channelsRef.current[peerId]?.close?.();
     delete channelsRef.current[peerId];
@@ -293,7 +303,6 @@ export default function Room() {
     delete namesRef.current[peerId];
     delete statusesRef.current[peerId];
 
-    // remove analyser
     if (analysersRef.current[peerId]) {
       try { analysersRef.current[peerId].source.disconnect(); } catch {}
       delete analysersRef.current[peerId];
@@ -302,21 +311,21 @@ export default function Room() {
     const wrap = document.getElementById(`wrapper-${peerId}`);
     if (wrap) wrap.remove();
 
-    if (activeSpeakerIdRef.current === peerId) {
-      activeSpeakerIdRef.current = null;
+    if (activeSpeakerRef.current === peerId) {
+      activeSpeakerRef.current = null;
       placeMain(null);
     }
     refreshParticipants();
   }
 
-  // --------- broadcast helper ----------
+  // ---------- Broadcast helper ----------
   function broadcast(payload) {
     Object.entries(channelsRef.current).forEach(([pid, ch]) => {
       if (ch && ch.readyState === "open") ch.send(JSON.stringify(payload));
     });
   }
 
-  // --------- UI controls ----------
+  // ---------- UI wiring ----------
   function wireControls() {
     const toggleAudio = document.getElementById("toggleAudio");
     const toggleVideo = document.getElementById("toggleVideo");
@@ -409,8 +418,8 @@ export default function Room() {
         b.className = "reaction-btn";
         b.innerText = emoji;
         b.onclick = () => {
-          // target = active speaker if exists, otherwise first remote, otherwise self
-          const target = activeSpeakerIdRef.current || (Object.keys(peersRef.current)[0] || selfIdRef.current);
+          // target = server-chosen active speaker if available; otherwise first remote; otherwise self
+          const target = activeSpeakerRef.current || (Object.keys(peersRef.current)[0] || selfIdRef.current);
           showReactionOnTile(target, emoji);
           broadcast({ type: "reaction", emoji, targetId: target });
         };
@@ -437,7 +446,7 @@ export default function Room() {
     document.getElementById("meLabel") && (document.getElementById("meLabel").innerText = selfNameRef.current);
   }
 
-  // --------- chat ----------
+  // ---------- Chat ----------
   function sendChat() {
     const input = document.getElementById("chatInput");
     if (!input) return;
@@ -457,7 +466,7 @@ export default function Room() {
     wrap.scrollTop = wrap.scrollHeight;
   }
 
-  // --------- participants ----------
+  // ---------- Participants UI ----------
   function refreshParticipants() {
     const list = document.getElementById("participantsList");
     if (!list) return;
@@ -489,7 +498,7 @@ export default function Room() {
     badgeWrap.innerHTML = raised ? `<span class="badge">✋</span>` : "";
   }
 
-  // --------- reaction bubble on tile ----------
+  // ---------- Reactions ----------
   function showReactionOnTile(targetId, emoji) {
     const wrapper = targetId === selfIdRef.current ? document.getElementById("wrapper-self") : document.getElementById(`wrapper-${targetId}`);
     if (!wrapper) return;
@@ -500,7 +509,7 @@ export default function Room() {
     setTimeout(() => bubble.remove(), 1400);
   }
 
-  // --------- recording ----------
+  // ---------- Recording ----------
   function startRecording() {
     const stream = localStreamRef.current;
     if (!stream) return;
@@ -520,10 +529,11 @@ export default function Room() {
   }
   function stopRecording() { mediaRecorderRef.current?.stop(); const rec = document.getElementById("recBtn"); if (rec) rec.innerText = "⏺️"; }
 
-  // --------- analysers & active speaker ----------
+  // ---------- Audio analysers ----------
   function attachAnalyser(peerId, stream) {
     try {
       if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      // remove previous
       if (analysersRef.current[peerId]) {
         try { analysersRef.current[peerId].source.disconnect(); } catch {}
         delete analysersRef.current[peerId];
@@ -539,65 +549,45 @@ export default function Room() {
     }
   }
 
-  function startActiveSpeakerLoop() {
-    const sampleInterval = 150; // ms
-    let lastCheck = performance.now();
-
-    const tick = () => {
-      const now = performance.now();
-      if (now - lastCheck >= sampleInterval) {
-        lastCheck = now;
+  // ---------- Speaking reporter (send candidate to server) ----------
+  function startSpeakingReporter() {
+    if (speakingIntervalRef.current) return;
+    speakingIntervalRef.current = setInterval(() => {
+      try {
         let bestId = null;
         let bestLevel = 0;
         Object.entries(analysersRef.current).forEach(([pid, a]) => {
           try {
             a.analyser.getByteFrequencyData(a.dataArray);
-            // average energy
             let sum = 0;
             for (let i = 0; i < a.dataArray.length; i++) sum += a.dataArray[i];
             const avg = sum / a.dataArray.length;
-            // skip self for active speaker selection
-            if (pid === selfIdRef.current) return;
+            // We consider remote loudness; include self optionally but server policy can ignore
             if (avg > bestLevel) { bestLevel = avg; bestId = pid; }
           } catch (e) {}
         });
-
-        // small threshold to avoid ambient noise
-        if (bestLevel > 10 && bestId) {
-          // candidate selection with cooldown
-          if (speakerCandidateRef.current !== bestId) {
-            speakerCandidateRef.current = bestId;
-            // candidate timestamp
-            speakerCandidateRef.current_ts = now;
-          } else {
-            // if candidate persisted for cooldown duration, switch
-            if ((now - (speakerCandidateRef.current_ts || now)) > SWITCH_COOLDOWN_MS) {
-              // if different than current active speaker, switch
-              if (activeSpeakerIdRef.current !== speakerCandidateRef.current) {
-                activeSpeakerIdRef.current = speakerCandidateRef.current;
-                placeMain(activeSpeakerIdRef.current);
-                lastSwitchTimeRef.current = now;
-              }
-            }
+        if (bestLevel > SPEAK_THRESHOLD && bestId) {
+          // prefer reporting remote participants; don't constantly spam same id
+          const already = lastReportedLoudestRef.current;
+          if (bestId !== already) {
+            lastReportedLoudestRef.current = bestId;
+            // send to server: server will broadcast "active-speaker"
+            try {
+              socketRef.current?.emit("speaking", { peerId: bestId });
+            } catch (e) {}
           }
-        } else {
-          // no loud speaker detected: don't change if currently have one and it was recent
-          // if silence for long, we could clear; keep current to avoid flicker
         }
-      }
-      requestAnimationFrame(tick);
-    };
-
-    requestAnimationFrame(tick);
+      } catch (e) {}
+    }, SPEAKING_REPORT_INTERVAL);
   }
 
-  // --------- main placement & thumbnail management ----------
+  // ---------- Place main tile (server controls) ----------
   function placeMain(peerId) {
     const mainArea = document.getElementById("main-area");
     const thumbs = document.getElementById("thumbs-area");
     if (!mainArea || !thumbs) return;
 
-    // move any non-self wrappers from main area back to thumbs
+    // move any non-self children back to thumbs
     Array.from(mainArea.children).forEach((child) => {
       if (child.id !== "wrapper-self") {
         thumbs.appendChild(child);
@@ -605,24 +595,14 @@ export default function Room() {
       }
     });
 
-    // decide what to place in main
     if (!peerId) {
-      // if no active speaker, place first remote if exists, otherwise keep self hidden in thumbs
+      // default: first remote if exists
       const firstRemote = Object.keys(peersRef.current)[0];
-      const idToShow = firstRemote || null;
-      if (idToShow) {
-        const wrap = document.getElementById(`wrapper-${idToShow}`);
+      if (firstRemote) {
+        const wrap = document.getElementById(`wrapper-${firstRemote}`);
         if (wrap) {
           mainArea.appendChild(wrap);
           wrap.className = "spotlight-wrapper";
-        }
-      } else {
-        // no remote peers: show placeholder or nothing (keep self only in thumbs)
-        const selfWrap = document.getElementById("wrapper-self");
-        if (selfWrap) {
-          // keep self in thumbs (user expects self small)
-          // but if you prefer self to be main when alone, uncomment:
-          // mainArea.appendChild(selfWrap); selfWrap.className = "spotlight-wrapper";
         }
       }
       return;
@@ -646,22 +626,21 @@ export default function Room() {
     wrap.className = "spotlight-wrapper";
   }
 
-  // initialize local wrapper and layout DOM once
+  // ---------- Initialize DOM layout (main + thumbs + local wrapper) ----------
   useEffect(() => {
     const grid = document.getElementById("video-grid");
     if (!grid) return;
 
-    // main area
+    // create main area and thumbs area
     const mainArea = document.createElement("div");
     mainArea.id = "main-area";
     mainArea.className = "main-area";
 
-    // thumbs area (vertical right)
     const thumbsArea = document.createElement("div");
     thumbsArea.id = "thumbs-area";
     thumbsArea.className = "thumbs-area";
 
-    // local wrapper (placed in thumbs by default)
+    // local wrapper (in thumbs by default)
     const selfWrap = document.createElement("div");
     selfWrap.id = "wrapper-self";
     selfWrap.className = "thumb-wrapper";
@@ -671,18 +650,18 @@ export default function Room() {
       <div class="badges" id="badges-self"></div>
     `;
 
-    // append to DOM
-    mainArea.appendChild(document.createElement("div")); // placeholder to keep layout even if empty
+    // append
+    mainArea.appendChild(document.createElement("div")); // placeholder so main isn't empty layout-wise
     thumbsArea.appendChild(selfWrap);
 
     grid.appendChild(mainArea);
     grid.appendChild(thumbsArea);
 
-    // wire controls now that local wrappers exist
+    // wire controls and refresh participants
     wireControls();
     refreshParticipants();
 
-    // cleanup on unmount
+    // cleanup
     return () => {
       try { mainArea.remove(); } catch {}
       try { thumbsArea.remove(); } catch {}
@@ -690,7 +669,7 @@ export default function Room() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // --------- sidebar toggle ----------
+  // ---------- Sidebar ----------
   function toggleSidebar(which) {
     const panel = document.getElementById("sidePanel");
     if (!panel) return;
@@ -702,10 +681,12 @@ export default function Room() {
     if (body) body.scrollTop = body.scrollHeight;
   }
 
-  // --------- utils ----------
-  function sanitize(s) { return String(s).replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m])); }
+  // ---------- util ----------
+  function sanitize(s) {
+    return String(s).replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m]));
+  }
 
-  // --------- render ----------
+  // ---------- Render ----------
   return (
     <div className="room-container">
       {/* Top Bar */}
@@ -719,7 +700,7 @@ export default function Room() {
         </div>
       </div>
 
-      {/* Video Grid */}
+      {/* Video grid */}
       <div id="video-grid" className="video-grid"></div>
 
       {/* Controls */}
@@ -784,7 +765,6 @@ export default function Room() {
         .room-info{color:var(--muted)}
         .top-actions button{margin-left:8px;background:transparent;border:1px solid rgba(255,255,255,0.03);color:#fff;padding:8px;border-radius:8px;cursor:pointer}
 
-        /* grid: main area + thumbs (vertical right) */
         .video-grid{flex:1;display:flex;gap:12px;padding:16px;align-items:stretch;justify-content:stretch;overflow:hidden}
         .main-area{flex:1;min-width:0;display:flex;align-items:center;justify-content:center}
         .thumbs-area{width:var(--thumb-width);display:flex;flex-direction:column;gap:12px;overflow:auto;padding:8px}
